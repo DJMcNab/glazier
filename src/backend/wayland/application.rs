@@ -14,7 +14,9 @@
 
 #![allow(clippy::single_match)]
 
-use super::{clipboard, error::Error};
+use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
+
+use super::{clipboard, error::Error, WaylandState};
 use crate::{backend::shared::linux, AppHandler};
 
 #[derive(Clone)]
@@ -23,6 +25,8 @@ pub struct Application {}
 impl Application {
     pub fn new() -> Result<Self, Error> {
         tracing::info!("wayland application initiated");
+
+        let conn = Connection::connect_to_env()?;
 
         Ok(Application {})
     }
@@ -48,8 +52,11 @@ impl Application {
         None
     }
 }
+
 #[derive(Clone)]
-pub struct AppHandle;
+pub struct AppHandle {
+    handle: QueueHandle<WaylandState>,
+}
 
 impl AppHandle {
     pub fn run_on_main<F>(&self, _callback: F)

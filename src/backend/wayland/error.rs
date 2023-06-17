@@ -16,13 +16,25 @@
 
 use std::fmt;
 
-#[derive(Debug, Clone)]
-pub enum Error {}
+use smithay_client_toolkit::reexports::client::ConnectError;
+
+#[derive(Debug)]
+pub enum Error {
+    Connect(ConnectError),
+}
 
 impl fmt::Display for Error {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        match *self {}
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            Error::Connect(e) => write!(f, "could not connect to the wayland server: {e:?}"),
+        }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<ConnectError> for Error {
+    fn from(value: ConnectError) -> Self {
+        Self::Connect(value)
+    }
+}

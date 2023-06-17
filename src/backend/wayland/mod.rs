@@ -14,9 +14,28 @@
 
 //! wayland platform support
 
+use smithay_client_toolkit::{
+    output::OutputState,
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+};
+
 pub mod application;
 pub mod clipboard;
 pub mod error;
 pub mod menu;
 pub mod screen;
 pub mod window;
+
+struct WaylandState {
+    pub registry_state: RegistryState,
+    // seat_state: SeatState,
+    pub output_state: OutputState,
+}
+
+impl ProvidesRegistryState for WaylandState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState];
+}
