@@ -13,19 +13,17 @@
 
 #![allow(clippy::single_match)]
 
-use tracing;
-use wayland_protocols::xdg_shell::client::xdg_popup;
-use wayland_protocols::xdg_shell::client::xdg_positioner;
-use wayland_protocols::xdg_shell::client::xdg_surface;
+use std::marker::PhantomData;
 
 use raw_window_handle::{
     HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
-    WaylandDisplayHandle, WaylandWindowHandle,
 };
+use tracing;
 
-use super::application::{self, Timer};
-use super::{error::Error, menu::Menu, outputs, surfaces};
+use super::application::{self};
+use super::menu::Menu;
 
+use crate::IdleToken;
 use crate::{
     dialog::FileDialogOptions,
     error::Error as ShellError,
@@ -37,65 +35,14 @@ use crate::{
     TextFieldToken,
 };
 
-pub use surfaces::idle::Handle as IdleHandle;
-
-// holds references to the various components for a window implementation.
-struct Inner {
-    pub(super) id: u64,
-    pub(super) decor: Box<dyn surfaces::Decor>,
-    pub(super) surface: Box<dyn surfaces::Handle>,
-    pub(super) outputs: Box<dyn surfaces::Outputs>,
-    pub(super) popup: Box<dyn surfaces::Popup>,
-    pub(super) appdata: std::sync::Weak<application::Data>,
-}
-
 #[derive(Clone)]
 pub struct WindowHandle {
-    inner: std::sync::Arc<Inner>,
-}
-
-impl surfaces::Outputs for WindowHandle {
-    fn removed(&self, o: &outputs::Meta) {
-        self.inner.outputs.removed(o)
-    }
-
-    fn inserted(&self, o: &outputs::Meta) {
-        self.inner.outputs.inserted(o)
-    }
-}
-
-impl surfaces::Popup for WindowHandle {
-    fn surface(
-        &self,
-        popup: &wayland_client::Main<xdg_surface::XdgSurface>,
-        pos: &wayland_client::Main<xdg_positioner::XdgPositioner>,
-    ) -> Result<wayland_client::Main<xdg_popup::XdgPopup>, Error> {
-        self.inner.popup.surface(popup, pos)
-    }
+    not_send: PhantomData<*mut ()>,
 }
 
 impl WindowHandle {
-    pub(super) fn new(
-        outputs: impl Into<Box<dyn surfaces::Outputs>>,
-        decor: impl Into<Box<dyn surfaces::Decor>>,
-        surface: impl Into<Box<dyn surfaces::Handle>>,
-        popup: impl Into<Box<dyn surfaces::Popup>>,
-        appdata: impl Into<std::sync::Weak<application::Data>>,
-    ) -> Self {
-        Self {
-            inner: std::sync::Arc::new(Inner {
-                id: surfaces::GLOBAL_ID.next(),
-                outputs: outputs.into(),
-                decor: decor.into(),
-                surface: surface.into(),
-                popup: popup.into(),
-                appdata: appdata.into(),
-            }),
-        }
-    }
-
     pub fn id(&self) -> u64 {
-        self.inner.id
+        todo!()
     }
 
     pub fn show(&self) {
@@ -123,12 +70,12 @@ impl WindowHandle {
         Insets::from(0.)
     }
 
-    pub fn set_size(&self, size: Size) {
-        self.inner.surface.set_size(size);
+    pub fn set_size(&self, _size: Size) {
+        todo!();
     }
 
     pub fn get_size(&self) -> Size {
-        self.inner.surface.get_size()
+        todo!()
     }
 
     pub fn set_window_state(&mut self, _current_state: window::WindowState) {
@@ -146,19 +93,7 @@ impl WindowHandle {
 
     /// Close the window.
     pub fn close(&self) {
-        if let Some(appdata) = self.inner.appdata.upgrade() {
-            tracing::trace!(
-                "closing window initiated {:?}",
-                appdata.active_surface_id.borrow()
-            );
-            appdata.handles.borrow_mut().remove(&self.id());
-            appdata.active_surface_id.borrow_mut().pop_front();
-            self.inner.surface.release();
-            tracing::trace!(
-                "closing window completed {:?}",
-                appdata.active_surface_id.borrow()
-            );
-        }
+        todo!()
     }
 
     /// Bring this window to the front of the window stack and give it focus.
@@ -168,74 +103,42 @@ impl WindowHandle {
 
     /// Request a new paint, but without invalidating anything.
     pub fn request_anim_frame(&self) {
-        self.inner.surface.request_anim_frame();
+        todo!()
     }
 
     /// Request invalidation of the entire window contents.
     pub fn invalidate(&self) {
-        self.inner.surface.invalidate();
+        todo!()
     }
 
     /// Request invalidation of one rectangle, which is given in display points relative to the
     /// drawing area.
-    pub fn invalidate_rect(&self, rect: Rect) {
-        self.inner.surface.invalidate_rect(rect);
+    pub fn invalidate_rect(&self, _rect: Rect) {
+        todo!()
     }
 
     pub fn add_text_field(&self) -> TextFieldToken {
-        TextFieldToken::next()
+        todo!()
     }
 
-    pub fn remove_text_field(&self, token: TextFieldToken) {
-        self.inner.surface.remove_text_field(token);
+    pub fn remove_text_field(&self, _token: TextFieldToken) {
+        todo!()
     }
 
-    pub fn set_focused_text_field(&self, active_field: Option<TextFieldToken>) {
-        self.inner.surface.set_focused_text_field(active_field);
+    pub fn set_focused_text_field(&self, _active_field: Option<TextFieldToken>) {
+        todo!()
     }
 
     pub fn update_text_field(&self, _token: TextFieldToken, _update: Event) {
         // noop until we get a real text input implementation
     }
 
-    pub fn request_timer(&self, deadline: std::time::Instant) -> TimerToken {
-        let appdata = match self.inner.appdata.upgrade() {
-            Some(d) => d,
-            None => {
-                tracing::warn!("requested timer on a window that was destroyed");
-                return Timer::new(self.id(), deadline).token();
-            }
-        };
-
-        let now = instant::Instant::now();
-        let mut timers = appdata.timers.borrow_mut();
-        let sooner = timers
-            .peek()
-            .map(|timer| deadline < timer.deadline())
-            .unwrap_or(true);
-
-        let timer = Timer::new(self.id(), deadline);
-        timers.push(timer);
-
-        // It is possible that the deadline has passed since it was set.
-        let timeout = if deadline < now {
-            std::time::Duration::ZERO
-        } else {
-            deadline - now
-        };
-
-        if sooner {
-            appdata.timer_handle.cancel_all_timeouts();
-            appdata.timer_handle.add_timeout(timeout, timer.token());
-        }
-
-        timer.token()
+    pub fn request_timer(&self, _deadline: std::time::Instant) -> TimerToken {
+        todo!()
     }
 
-    pub fn set_cursor(&mut self, cursor: &Cursor) {
-        if let Some(appdata) = self.inner.appdata.upgrade() {
-            appdata.set_cursor(cursor);
-        }
+    pub fn set_cursor(&mut self, _cursor: &Cursor) {
+        todo!()
     }
 
     pub fn make_cursor(&self, _desc: &CursorDesc) -> Option<Cursor> {
@@ -255,12 +158,12 @@ impl WindowHandle {
 
     /// Get a handle that can be used to schedule an idle task.
     pub fn get_idle_handle(&self) -> Option<IdleHandle> {
-        Some(self.inner.surface.get_idle_handle())
+        todo!()
     }
 
     /// Get the `Scale` of the window.
     pub fn get_scale(&self) -> Result<Scale, ShellError> {
-        Ok(self.inner.surface.get_scale())
+        todo!()
     }
 
     pub fn set_menu(&self, _menu: Menu) {
@@ -271,16 +174,8 @@ impl WindowHandle {
         tracing::warn!("show_context_menu not implement for wayland");
     }
 
-    pub fn set_title(&self, title: impl Into<String>) {
-        self.inner.decor.set_title(title);
-    }
-
-    pub(super) fn run_idle(&self) {
-        self.inner.surface.run_idle();
-    }
-
-    pub(super) fn data(&self) -> Option<std::sync::Arc<surfaces::surface::Data>> {
-        self.inner.surface.data()
+    pub fn set_title(&self, _title: impl Into<String>) {
+        todo!()
     }
 
     #[cfg(feature = "accesskit")]
@@ -293,8 +188,8 @@ impl WindowHandle {
 }
 
 impl PartialEq for WindowHandle {
-    fn eq(&self, rhs: &Self) -> bool {
-        self.id() == rhs.id()
+    fn eq(&self, _rhs: &Self) -> bool {
+        todo!()
     }
 }
 
@@ -303,14 +198,7 @@ impl Eq for WindowHandle {}
 impl Default for WindowHandle {
     fn default() -> WindowHandle {
         WindowHandle {
-            inner: std::sync::Arc::new(Inner {
-                id: surfaces::GLOBAL_ID.next(),
-                outputs: Box::<surfaces::surface::Dead>::default(),
-                decor: Box::<surfaces::surface::Dead>::default(),
-                surface: Box::<surfaces::surface::Dead>::default(),
-                popup: Box::<surfaces::surface::Dead>::default(),
-                appdata: std::sync::Weak::new(),
-            }),
+            not_send: Default::default(),
         }
     }
 }
@@ -318,14 +206,30 @@ impl Default for WindowHandle {
 unsafe impl HasRawWindowHandle for WindowHandle {
     fn raw_window_handle(&self) -> RawWindowHandle {
         tracing::error!("HasRawWindowHandle trait not implemented for wasm.");
-        RawWindowHandle::Wayland(WaylandWindowHandle::empty())
+        todo!()
     }
 }
 
 unsafe impl HasRawDisplayHandle for WindowHandle {
     fn raw_display_handle(&self) -> RawDisplayHandle {
         tracing::error!("HasDisplayHandle trait not implemented for wayland.");
-        RawDisplayHandle::Wayland(WaylandDisplayHandle::empty())
+        todo!()
+    }
+}
+
+#[derive(Clone)]
+pub struct IdleHandle {}
+
+impl IdleHandle {
+    pub fn add_idle_callback<F>(&self, _callback: F)
+    where
+        F: FnOnce(&mut dyn WinHandler) + Send + 'static,
+    {
+        todo!();
+    }
+
+    pub fn add_idle_token(&self, _token: IdleToken) {
+        todo!();
     }
 }
 
@@ -334,7 +238,6 @@ pub struct CustomCursor;
 
 /// Builder abstraction for creating new windows
 pub(crate) struct WindowBuilder {
-    appdata: std::sync::Weak<application::Data>,
     handler: Option<Box<dyn WinHandler>>,
     title: String,
     menu: Option<Menu>,
@@ -349,9 +252,8 @@ pub(crate) struct WindowBuilder {
 }
 
 impl WindowBuilder {
-    pub fn new(app: application::Application) -> WindowBuilder {
+    pub fn new(_app: application::Application) -> WindowBuilder {
         WindowBuilder {
-            appdata: std::sync::Arc::downgrade(&app.data),
             handler: None,
             title: String::new(),
             menu: None,
@@ -423,237 +325,6 @@ impl WindowBuilder {
     }
 
     pub fn build(self) -> Result<WindowHandle, ShellError> {
-        if matches!(self.menu, Some(_)) {
-            tracing::warn!("menus unimplemented for wayland");
-        }
-
-        let level = self.level.clone();
-
-        if let WindowLevel::Modal(parent) = level {
-            return self.create_popup(parent);
-        }
-
-        if let WindowLevel::DropDown(parent) = level {
-            return self.create_popup(parent);
-        }
-
-        let appdata = match self.appdata.upgrade() {
-            Some(d) => d,
-            None => return Err(ShellError::ApplicationDropped),
-        };
-
-        let handler = self.handler.expect("must set a window handler");
-
-        let surface =
-            surfaces::toplevel::Surface::new(appdata.clone(), handler, self.size, self.min_size);
-
-        (&surface as &dyn surfaces::Decor).set_title(self.title);
-
-        let handle = WindowHandle::new(
-            surface.clone(),
-            surface.clone(),
-            surface.clone(),
-            surface.clone(),
-            self.appdata.clone(),
-        );
-
-        if appdata
-            .handles
-            .borrow_mut()
-            .insert(handle.id(), handle.clone())
-            .is_some()
-        {
-            return Err(ShellError::Platform(
-                Error::string("wayland should use a unique id").into(),
-            ));
-        }
-
-        appdata
-            .active_surface_id
-            .borrow_mut()
-            .push_front(handle.id());
-
-        surface.with_handler({
-            let handle = handle.clone();
-            move |winhandle| {
-                winhandle
-                    .connect(&crate::backend::linux::window::WindowHandle::Wayland(handle).into())
-            }
-        });
-
-        Ok(handle)
-    }
-
-    fn create_popup(self, parent: window::WindowHandle) -> Result<WindowHandle, ShellError> {
-        let dim = self.min_size.unwrap_or(Size::ZERO);
-        let dim = Size::new(dim.width.max(1.), dim.height.max(1.));
-        let dim = Size::new(
-            self.size.width.max(dim.width),
-            self.size.height.max(dim.height),
-        );
-
-        let config = surfaces::popup::Config::default()
-            .with_size(dim)
-            .with_offset(Into::into(
-                self.position.unwrap_or_else(|| Into::into((0., 0.))),
-            ));
-
-        tracing::debug!("popup {:?}", config);
-
-        popup::create(
-            parent.0.unwrap_wayland(),
-            &config,
-            self.appdata,
-            self.handler,
-        )
-    }
-}
-
-#[allow(unused)]
-pub mod layershell {
-    use crate::backend::error::Error::Wayland as WaylandError;
-    use crate::error::Error as ShellError;
-    use crate::window::WinHandler;
-
-    use super::WindowHandle;
-    use crate::backend::wayland::application::{Application, Data};
-    use crate::backend::wayland::error::Error;
-    use crate::backend::wayland::surfaces;
-
-    /// Builder abstraction for creating new windows
-    pub(crate) struct Builder {
-        appdata: std::sync::Weak<Data>,
-        winhandle: Option<Box<dyn WinHandler>>,
-        pub(crate) config: surfaces::layershell::Config,
-    }
-
-    impl Builder {
-        pub fn new(app: Application) -> Builder {
-            Builder {
-                appdata: std::sync::Arc::downgrade(&app.data),
-                config: surfaces::layershell::Config::default(),
-                winhandle: None,
-            }
-        }
-
-        pub fn set_handler(&mut self, handler: Box<dyn WinHandler>) {
-            self.winhandle = Some(handler);
-        }
-
-        pub fn build(self) -> Result<WindowHandle, ShellError> {
-            let appdata = match self.appdata.upgrade() {
-                Some(d) => d,
-                None => return Err(ShellError::ApplicationDropped),
-            };
-
-            let winhandle = match self.winhandle {
-                Some(winhandle) => winhandle,
-                None => {
-                    return Err(ShellError::Platform(WaylandError(Error::string(
-                        "window handler required",
-                    ))))
-                }
-            };
-
-            let surface =
-                surfaces::layershell::Surface::new(appdata.clone(), winhandle, self.config.clone());
-
-            let handle = WindowHandle::new(
-                surface.clone(),
-                surfaces::surface::Dead::default(),
-                surface.clone(),
-                surface.clone(),
-                self.appdata.clone(),
-            );
-
-            if appdata
-                .handles
-                .borrow_mut()
-                .insert(handle.id(), handle.clone())
-                .is_some()
-            {
-                panic!("wayland should use unique object IDs");
-            }
-            appdata
-                .active_surface_id
-                .borrow_mut()
-                .push_front(handle.id());
-
-            surface.with_handler({
-                let handle = handle.clone();
-                move |winhandle| winhandle.connect(&handle.into())
-            });
-
-            Ok(handle)
-        }
-    }
-}
-
-#[allow(unused)]
-pub mod popup {
-    use crate::error::Error as ShellError;
-    use crate::window::WinHandler;
-
-    use super::WindowBuilder;
-    use super::WindowHandle;
-    use crate::backend::wayland::application::{Application, Data};
-    use crate::backend::wayland::error::Error;
-    use crate::backend::wayland::surfaces;
-
-    pub(super) fn create(
-        parent: &WindowHandle,
-        config: &surfaces::popup::Config,
-        wappdata: std::sync::Weak<Data>,
-        winhandle: Option<Box<dyn WinHandler>>,
-    ) -> Result<WindowHandle, ShellError> {
-        let appdata = match wappdata.upgrade() {
-            Some(d) => d,
-            None => return Err(ShellError::ApplicationDropped),
-        };
-
-        let winhandle = match winhandle {
-            Some(winhandle) => winhandle,
-            None => {
-                return Err(ShellError::Platform(
-                    Error::string("window handler required").into(),
-                ))
-            }
-        };
-
-        // compute the initial window size.
-        let updated = config.clone();
-        let surface =
-            match surfaces::popup::Surface::new(appdata.clone(), winhandle, updated, parent) {
-                Err(cause) => return Err(ShellError::Platform(cause.into())),
-                Ok(s) => s,
-            };
-
-        let handle = WindowHandle::new(
-            surface.clone(),
-            surfaces::surface::Dead::default(),
-            surface.clone(),
-            surface.clone(),
-            wappdata,
-        );
-
-        if appdata
-            .handles
-            .borrow_mut()
-            .insert(handle.id(), handle.clone())
-            .is_some()
-        {
-            panic!("wayland should use unique object IDs");
-        }
-        appdata
-            .active_surface_id
-            .borrow_mut()
-            .push_front(handle.id());
-
-        surface.with_handler({
-            let handle = handle.clone();
-            move |winhandle| winhandle.connect(&handle.into())
-        });
-
-        Ok(handle)
+        todo!()
     }
 }
