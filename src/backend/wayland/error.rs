@@ -16,17 +16,24 @@
 
 use std::fmt;
 
-use smithay_client_toolkit::reexports::client::ConnectError;
+use smithay_client_toolkit::reexports::{
+    calloop,
+    client::{globals::BindError, ConnectError},
+};
 
 #[derive(Debug)]
 pub enum Error {
     Connect(ConnectError),
+    Bind(BindError),
+    Calloop(calloop::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
-            Error::Connect(e) => write!(f, "could not connect to the wayland server: {e:?}"),
+            Error::Connect(e) => write!(f, "could not connect to the wayland server: {e:}"),
+            Error::Bind(e) => write!(f, "could not bind a wayland global: {e:}"),
+            Error::Calloop(e) => write!(f, "calloop failed: {e:}"),
         }
     }
 }
@@ -36,5 +43,17 @@ impl std::error::Error for Error {}
 impl From<ConnectError> for Error {
     fn from(value: ConnectError) -> Self {
         Self::Connect(value)
+    }
+}
+
+impl From<BindError> for Error {
+    fn from(value: BindError) -> Self {
+        Self::Bind(value)
+    }
+}
+
+impl From<calloop::Error> for Error {
+    fn from(value: calloop::Error) -> Self {
+        Self::Calloop(value)
     }
 }
