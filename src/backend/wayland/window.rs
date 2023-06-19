@@ -13,15 +13,20 @@
 
 #![allow(clippy::single_match)]
 
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 
 use raw_window_handle::{
     HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
 use smithay_client_toolkit::compositor::CompositorHandler;
-use smithay_client_toolkit::shell::xdg::window::WindowHandler;
+use smithay_client_toolkit::reexports::client::{protocol, Connection, QueueHandle};
+use smithay_client_toolkit::shell::xdg::window::{DecorationMode, Window, WindowHandler};
+use smithay_client_toolkit::shell::xdg::{XdgShellSurface, XdgSurface};
+use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_compositor, delegate_xdg_shell, delegate_xdg_window};
 use tracing;
+use wayland_backend::client::ObjectId;
 
 use super::application::{self};
 use super::menu::Menu;
@@ -41,6 +46,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct WindowHandle {
+    wayland_window: Window,
     not_send: PhantomData<*mut ()>,
 }
 
@@ -51,18 +57,31 @@ impl WindowHandle {
 
     pub fn show(&self) {
         tracing::debug!("show initiated");
+        self.wayland_window.offset(x, y)
     }
 
-    pub fn resizable(&self, _resizable: bool) {
+    pub fn resizable(&self, resizable: bool) {
         tracing::warn!("resizable is unimplemented on wayland");
+        // TODO: If we are using fallback decorations, we should be able to disable
+        // dragging based resizing
     }
 
-    pub fn show_titlebar(&self, _show_titlebar: bool) {
-        tracing::warn!("show_titlebar is unimplemented on wayland");
+    pub fn show_titlebar(&self, show_titlebar: bool) {
+        tracing::warn!("show_titlebar is implemented on a best-effort basis on wayland");
+        if show_titlebar {
+            self.wayland_window
+                .request_decoration_mode(Some(DecorationMode::Server))
+        } else {
+            // TODO: Track this into the fallback decorations, somehow
+            self.wayland_window
+                .request_decoration_mode(Some(DecorationMode::Client))
+        }
     }
 
     pub fn set_position(&self, _position: Point) {
         tracing::warn!("set_position is unimplemented on wayland");
+        // TODO: Use the KDE plasma extensions for this if available
+        // TODO: Use xdg_positioner if this is a child window
     }
 
     pub fn get_position(&self) -> Point {
@@ -71,22 +90,31 @@ impl WindowHandle {
     }
 
     pub fn content_insets(&self) -> Insets {
+        // I *think* wayland surfaces don't care about content insets
+        // That is, all decorations are 'outsets'. Therefore this is complete
         Insets::from(0.)
     }
 
     pub fn set_size(&self, _size: Size) {
-        todo!();
+        tracing::warn!("set_size is unimplemented on wayland");
     }
 
     pub fn get_size(&self) -> Size {
+        // I think we need to cache the size ourselves
         todo!()
     }
 
-    pub fn set_window_state(&mut self, _current_state: window::WindowState) {
-        tracing::warn!("set_window_state is unimplemented on wayland");
+    pub fn set_window_state(&mut self, state: window::WindowState) {
+        match state {
+            crate::WindowState::Maximized => self.wayland_window.set_maximized(),
+            crate::WindowState::Minimized => self.wayland_window.set_minimized(),
+            // TODO: I don't think we can do much better than this - we can't unset being minimised
+            crate::WindowState::Restored => self.wayland_window.unset_maximized(),
+        }
     }
 
     pub fn get_window_state(&self) -> window::WindowState {
+        // We can know if we're maximised
         tracing::warn!("get_window_state is unimplemented on wayland");
         window::WindowState::Maximized
     }
@@ -201,6 +229,7 @@ impl Eq for WindowHandle {}
 
 impl Default for WindowHandle {
     fn default() -> WindowHandle {
+        // TODO: Why is this Default?
         WindowHandle {
             not_send: Default::default(),
         }
@@ -333,6 +362,21 @@ impl WindowBuilder {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct WindowId(ObjectId);
+
+impl WindowId {
+    pub fn new(surface: &impl WaylandSurface) -> Self {
+        Self(surface.wl_surface().borrow().clone())
+    }
+}
+
+/// The state associated with each window, stored in [`WaylandState`]
+pub struct WindowState {
+    handler: Box<dyn WinHandler>,
+    wayland_window: Window,
+}
+
 delegate_xdg_shell!(WaylandState);
 delegate_xdg_window!(WaylandState);
 
@@ -341,30 +385,30 @@ delegate_compositor!(WaylandState);
 impl CompositorHandler for WaylandState {
     fn scale_factor_changed(
         &mut self,
-        conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &protocol::wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        todo!()
+        let window = self.windows.get_mut(&WindowId::new(surface));
     }
 
     fn frame(
         &mut self,
-        conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &protocol::wl_surface::WlSurface,
         time: u32,
     ) {
-        todo!()
+        let window = self.windows.get_mut(&WindowId::new(surface));
     }
 }
 
 impl WindowHandler for WaylandState {
     fn request_close(
         &mut self,
-        conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
         window: &smithay_client_toolkit::shell::xdg::window::Window,
     ) {
         todo!()
@@ -372,12 +416,12 @@ impl WindowHandler for WaylandState {
 
     fn configure(
         &mut self,
-        conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
         window: &smithay_client_toolkit::shell::xdg::window::Window,
         configure: smithay_client_toolkit::shell::xdg::window::WindowConfigure,
         serial: u32,
     ) {
-        todo!()
+        window.show_window_menu(seat, serial, position)
     }
 }
