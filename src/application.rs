@@ -201,7 +201,7 @@ impl AppHandle {
     where
         F: FnOnce(Option<&mut dyn AppHandler>) + Send + 'static,
     {
-        self.0.run_on_main(callback)
+        self.0.run_on_main(callback);
     }
 }
 

@@ -18,10 +18,14 @@ use std::marker::PhantomData;
 use raw_window_handle::{
     HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
+use smithay_client_toolkit::compositor::CompositorHandler;
+use smithay_client_toolkit::shell::xdg::window::WindowHandler;
+use smithay_client_toolkit::{delegate_compositor, delegate_xdg_shell, delegate_xdg_window};
 use tracing;
 
 use super::application::{self};
 use super::menu::Menu;
+use super::WaylandState;
 
 use crate::IdleToken;
 use crate::{
@@ -325,6 +329,55 @@ impl WindowBuilder {
     }
 
     pub fn build(self) -> Result<WindowHandle, ShellError> {
+        todo!()
+    }
+}
+
+delegate_xdg_shell!(WaylandState);
+delegate_xdg_window!(WaylandState);
+
+delegate_compositor!(WaylandState);
+
+impl CompositorHandler for WaylandState {
+    fn scale_factor_changed(
+        &mut self,
+        conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        new_factor: i32,
+    ) {
+        todo!()
+    }
+
+    fn frame(
+        &mut self,
+        conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        time: u32,
+    ) {
+        todo!()
+    }
+}
+
+impl WindowHandler for WaylandState {
+    fn request_close(
+        &mut self,
+        conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        window: &smithay_client_toolkit::shell::xdg::window::Window,
+    ) {
+        todo!()
+    }
+
+    fn configure(
+        &mut self,
+        conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        window: &smithay_client_toolkit::shell::xdg::window::Window,
+        configure: smithay_client_toolkit::shell::xdg::window::WindowConfigure,
+        serial: u32,
+    ) {
         todo!()
     }
 }

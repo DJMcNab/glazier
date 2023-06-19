@@ -14,11 +14,22 @@
 
 //! wayland platform support
 
+use std::sync::{
+    mpsc::{Receiver, Sender},
+    Arc, Mutex,
+};
+
 use smithay_client_toolkit::{
+    compositor::CompositorState,
+    delegate_registry,
     output::OutputState,
+    reexports::calloop::EventLoop,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    shell::xdg::XdgShell,
 };
+
+use crate::AppHandler;
 
 pub mod application;
 pub mod clipboard;
@@ -31,7 +42,16 @@ struct WaylandState {
     pub registry_state: RegistryState,
     // seat_state: SeatState,
     pub output_state: OutputState,
+    pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShell,
+
+    pub event_loop: Option<EventLoop<'static, Self>>,
+    pub handler: Option<Box<dyn AppHandler>>,
+    pub idle_callbacks: Receiver<IdleCallback>,
+    pub idle_sender: Arc<Mutex<Sender<IdleCallback>>>,
 }
+
+delegate_registry!(WaylandState);
 
 impl ProvidesRegistryState for WaylandState {
     fn registry(&mut self) -> &mut RegistryState {
@@ -39,3 +59,5 @@ impl ProvidesRegistryState for WaylandState {
     }
     registry_handlers![OutputState];
 }
+
+type IdleCallback = Box<dyn FnOnce(&mut WaylandState) + Send>;
