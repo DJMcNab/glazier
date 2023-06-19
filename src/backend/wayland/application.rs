@@ -16,6 +16,7 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     rc::Rc,
     sync::{
         mpsc::{Sender, TryRecvError},
@@ -84,6 +85,7 @@ impl Application {
             handler: None,
             idle_callbacks,
             idle_sender: idle_sender.clone(),
+            windows: HashMap::new(),
         };
         Ok(Application {
             state: Rc::new(RefCell::new(Some(state))),
@@ -117,11 +119,13 @@ impl Application {
     }
 
     pub fn quit(&self) {
-        todo!()
+        // Stopping the event loop serves to
+        self.loop_signal.stop();
     }
 
     pub fn clipboard(&self) -> clipboard::Clipboard {
-        todo!()
+        // TODO: Wayland's clipboard is inherently asynchronous (as is the web)
+        clipboard::Clipboard {}
     }
 
     pub fn get_locale() -> String {

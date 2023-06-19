@@ -14,9 +14,12 @@
 
 //! wayland platform support
 
-use std::sync::{
-    mpsc::{Receiver, Sender},
-    Arc, Mutex,
+use std::{
+    collections::HashMap,
+    sync::{
+        mpsc::{Receiver, Sender},
+        Arc, Mutex,
+    },
 };
 
 use smithay_client_toolkit::{
@@ -31,6 +34,8 @@ use smithay_client_toolkit::{
 
 use crate::AppHandler;
 
+use self::window::{WindowId, WindowState};
+
 pub mod application;
 pub mod clipboard;
 pub mod error;
@@ -38,6 +43,9 @@ pub mod menu;
 pub mod screen;
 pub mod window;
 
+// The main state type of the event loop. Implements dispatching for all supported
+// wayland events
+// All fields are public, as this type is *not* exported above this module
 struct WaylandState {
     pub registry_state: RegistryState,
     // seat_state: SeatState,
@@ -49,6 +57,8 @@ struct WaylandState {
     pub handler: Option<Box<dyn AppHandler>>,
     pub idle_callbacks: Receiver<IdleCallback>,
     pub idle_sender: Arc<Mutex<Sender<IdleCallback>>>,
+
+    pub windows: HashMap<WindowId, WindowState>,
 }
 
 delegate_registry!(WaylandState);
