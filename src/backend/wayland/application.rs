@@ -163,15 +163,25 @@ impl AppHandle {
         })
     }
 
-    pub fn run_on_main_inner<F>(&self, callback: F)
+    pub(super) fn run_on_main_inner<F>(&self, callback: F)
     where
         F: FnOnce(Option<&mut Box<dyn AppHandler>>) + Send + 'static,
+    {
+        self.run_idle(move |state| callback(state.handler.as_mut()));
+        self.loop_signal.wakeup();
+    }
+
+    /// Run a function when the event loop is idle
+    /// This does not wake up the event loop to run this handler
+    // TODO: Should it?
+    pub(super) fn run_idle<F>(&self, callback: F)
+    where
+        F: FnOnce(&mut WaylandState) + Send + 'static,
     {
         self.idle_sender
             .lock()
             .unwrap()
-            .send(Box::new(move |state| callback(state.handler.as_mut())))
+            .send(Box::new(move |state| callback(state)))
             .expect("AppHandle should exist whilst");
-        self.loop_signal.wakeup();
     }
 }
