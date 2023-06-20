@@ -13,22 +13,25 @@
 
 #![allow(clippy::single_match)]
 
-use std::borrow::Borrow;
+use std::borrow::BorrowMut;
 use std::marker::PhantomData;
+use std::os::raw::c_void;
+use std::sync::{Arc, RwLock, Weak};
 
 use raw_window_handle::{
     HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
+    WaylandDisplayHandle, WaylandWindowHandle,
 };
 use smithay_client_toolkit::compositor::CompositorHandler;
-use smithay_client_toolkit::reexports::client::{protocol, Connection, QueueHandle};
+use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
+use smithay_client_toolkit::reexports::client::{protocol, Connection, Proxy, QueueHandle};
 use smithay_client_toolkit::shell::xdg::window::{DecorationMode, Window, WindowHandler};
-use smithay_client_toolkit::shell::xdg::{XdgShellSurface, XdgSurface};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_compositor, delegate_xdg_shell, delegate_xdg_window};
 use tracing;
 use wayland_backend::client::ObjectId;
 
-use super::application::{self};
+use super::application::{self, AppHandle};
 use super::menu::Menu;
 use super::WaylandState;
 
@@ -46,18 +49,25 @@ use crate::{
 
 #[derive(Clone)]
 pub struct WindowHandle {
-    wayland_window: Window,
+    // Annoyingly Option, because
+    wayland_window: Option<Window>,
+    properties: Weak<RwLock<WindowProperties>>,
+    // Safety: Points to a wl_display instance
+    raw_display_handle: Option<*mut c_void>,
     not_send: PhantomData<*mut ()>,
 }
 
 impl WindowHandle {
-    pub fn id(&self) -> u64 {
-        todo!()
+    #[track_caller]
+    fn wayland_window(&self) -> &Window {
+        self.wayland_window
+            .as_ref()
+            .expect("Called operation on dead window")
     }
-
     pub fn show(&self) {
         tracing::debug!("show initiated");
-        self.wayland_window.offset(x, y)
+        self.wayland_window().commit();
+        self.request_anim_frame();
     }
 
     pub fn resizable(&self, resizable: bool) {
@@ -69,11 +79,11 @@ impl WindowHandle {
     pub fn show_titlebar(&self, show_titlebar: bool) {
         tracing::warn!("show_titlebar is implemented on a best-effort basis on wayland");
         if show_titlebar {
-            self.wayland_window
+            self.wayland_window()
                 .request_decoration_mode(Some(DecorationMode::Server))
         } else {
             // TODO: Track this into the fallback decorations, somehow
-            self.wayland_window
+            self.wayland_window()
                 .request_decoration_mode(Some(DecorationMode::Client))
         }
     }
@@ -91,7 +101,7 @@ impl WindowHandle {
 
     pub fn content_insets(&self) -> Insets {
         // I *think* wayland surfaces don't care about content insets
-        // That is, all decorations are 'outsets'. Therefore this is complete
+        // That is, all decorations (to confirm: even client side?) are 'outsets'
         Insets::from(0.)
     }
 
@@ -106,10 +116,10 @@ impl WindowHandle {
 
     pub fn set_window_state(&mut self, state: window::WindowState) {
         match state {
-            crate::WindowState::Maximized => self.wayland_window.set_maximized(),
-            crate::WindowState::Minimized => self.wayland_window.set_minimized(),
+            crate::WindowState::Maximized => self.wayland_window().set_maximized(),
+            crate::WindowState::Minimized => self.wayland_window().set_minimized(),
             // TODO: I don't think we can do much better than this - we can't unset being minimised
-            crate::WindowState::Restored => self.wayland_window.unset_maximized(),
+            crate::WindowState::Restored => self.wayland_window().unset_maximized(),
         }
     }
 
@@ -220,8 +230,8 @@ impl WindowHandle {
 }
 
 impl PartialEq for WindowHandle {
-    fn eq(&self, _rhs: &Self) -> bool {
-        todo!()
+    fn eq(&self, rhs: &Self) -> bool {
+        self.wayland_window() == rhs.wayland_window()
     }
 }
 
@@ -232,37 +242,56 @@ impl Default for WindowHandle {
         // TODO: Why is this Default?
         WindowHandle {
             not_send: Default::default(),
+            wayland_window: None,
+            properties: Weak::new(),
+            raw_display_handle: None,
         }
     }
 }
 
 unsafe impl HasRawWindowHandle for WindowHandle {
     fn raw_window_handle(&self) -> RawWindowHandle {
-        tracing::error!("HasRawWindowHandle trait not implemented for wasm.");
-        todo!()
+        let mut handle = WaylandWindowHandle::empty();
+        handle.surface = self.wayland_window().wl_surface().id().as_ptr() as *mut _;
+        RawWindowHandle::Wayland(handle)
     }
 }
 
 unsafe impl HasRawDisplayHandle for WindowHandle {
     fn raw_display_handle(&self) -> RawDisplayHandle {
-        tracing::error!("HasDisplayHandle trait not implemented for wayland.");
-        todo!()
+        let mut handle = WaylandDisplayHandle::empty();
+        handle.display = self
+            .raw_display_handle
+            .expect("Window can only be created with a valid display pointer");
+        RawDisplayHandle::Wayland(handle)
     }
 }
 
 #[derive(Clone)]
-pub struct IdleHandle {}
+pub struct IdleHandle {
+    window: WindowId,
+    app: AppHandle,
+}
 
 impl IdleHandle {
-    pub fn add_idle_callback<F>(&self, _callback: F)
+    pub fn add_idle_callback<F>(&self, callback: F)
     where
         F: FnOnce(&mut dyn WinHandler) + Send + 'static,
     {
-        todo!();
+        let window = self.window.clone();
+        self.app.run_idle(move |state| {
+            let win_state = state.windows.borrow_mut().get_mut(&window);
+            if let Some(win_state) = win_state {
+                callback(&mut *win_state.handler);
+            } else {
+                tracing::error!("Ran add_idle_callback on a window which no longer exists")
+            }
+        });
     }
 
-    pub fn add_idle_token(&self, _token: IdleToken) {
-        todo!();
+    pub fn add_idle_token(&self, token: IdleToken) {
+        // TODO: Use a specialised type rather than dynamic dispatch for these tokens
+        self.add_idle_callback(move |handler| handler.idle(token))
     }
 }
 
@@ -363,11 +392,16 @@ impl WindowBuilder {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
+// TODO: According to https://github.com/linebender/druid/pull/2033, this should not be
+// synced with the ID of the surface
 pub(super) struct WindowId(ObjectId);
 
 impl WindowId {
     pub fn new(surface: &impl WaylandSurface) -> Self {
-        Self(surface.wl_surface().borrow().clone())
+        Self::of_surface(surface.wl_surface())
+    }
+    pub fn of_surface(surface: &WlSurface) -> Self {
+        Self(surface.id().clone())
     }
 }
 
@@ -375,6 +409,13 @@ impl WindowId {
 pub struct WindowState {
     handler: Box<dyn WinHandler>,
     wayland_window: Window,
+    properties: Arc<RwLock<WindowProperties>>,
+}
+
+struct WindowProperties {
+    requested_size: Option<Size>,
+    current_dimensions: [u32; 2],
+    current_scale: Scale,
 }
 
 delegate_xdg_shell!(WaylandState);
@@ -388,9 +429,17 @@ impl CompositorHandler for WaylandState {
         conn: &Connection,
         qh: &QueueHandle<Self>,
         surface: &protocol::wl_surface::WlSurface,
+        // TODO: Support the fractional-scaling extension instead
+        // This requires update in client-toolkit and wayland-protocols
         new_factor: i32,
     ) {
-        let window = self.windows.get_mut(&WindowId::new(surface));
+        let window = self.windows.get_mut(&WindowId::of_surface(surface));
+        let window = window.expect("Should only get events for real windows");
+        let factor = f64::from(new_factor);
+        let scale = Scale::new(factor, factor);
+        window.handler.scale(scale);
+        // TODO: The logical size has changed - report this to the client
+        // window.handler.size(size)
     }
 
     fn frame(
@@ -400,7 +449,7 @@ impl CompositorHandler for WaylandState {
         surface: &protocol::wl_surface::WlSurface,
         time: u32,
     ) {
-        let window = self.windows.get_mut(&WindowId::new(surface));
+        let window = self.windows.get_mut(&WindowId::of_surface(surface));
     }
 }
 
@@ -422,6 +471,6 @@ impl WindowHandler for WaylandState {
         configure: smithay_client_toolkit::shell::xdg::window::WindowConfigure,
         serial: u32,
     ) {
-        window.show_window_menu(seat, serial, position)
+        let window: Option<&mut WindowState> = self.windows.get_mut(&WindowId::new(window));
     }
 }
