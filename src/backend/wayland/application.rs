@@ -86,6 +86,7 @@ impl Application {
             idle_callbacks,
             idle_sender: idle_sender.clone(),
             windows: HashMap::new(),
+            wayland_queue: qh.clone(),
         };
         Ok(Application {
             state: Rc::new(RefCell::new(Some(state))),
@@ -119,7 +120,7 @@ impl Application {
     }
 
     pub fn quit(&self) {
-        // Stopping the event loop serves to
+        // Stopping the event loop appears to be the only way to do this?
         self.loop_signal.stop();
     }
 
@@ -163,12 +164,11 @@ impl AppHandle {
         })
     }
 
-    pub(super) fn run_on_main_inner<F>(&self, callback: F)
+    fn run_on_main_inner<F>(&self, callback: F)
     where
         F: FnOnce(Option<&mut Box<dyn AppHandler>>) + Send + 'static,
     {
-        self.run_idle(move |state| callback(state.handler.as_mut()));
-        self.loop_signal.wakeup();
+        self.run_on_state(move |state| callback(state.handler.as_mut()));
     }
 
     /// Run a function when the event loop is idle
@@ -183,5 +183,15 @@ impl AppHandle {
             .unwrap()
             .send(Box::new(move |state| callback(state)))
             .expect("AppHandle should exist whilst");
+    }
+
+    /// Same as run_idle, but wakes up the main thread
+    /// TODO: Should this be a manual calloop thing?
+    pub(super) fn run_on_state<F>(&self, callback: F)
+    where
+        F: FnOnce(&mut WaylandState) + Send + 'static,
+    {
+        self.run_idle(callback);
+        self.loop_signal.wakeup();
     }
 }

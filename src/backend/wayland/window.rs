@@ -35,7 +35,6 @@ use super::application::{self, AppHandle};
 use super::menu::Menu;
 use super::WaylandState;
 
-use crate::IdleToken;
 use crate::{
     dialog::FileDialogOptions,
     error::Error as ShellError,
@@ -46,11 +45,13 @@ use crate::{
     window::{self, FileDialogToken, TimerToken, WinHandler, WindowLevel},
     TextFieldToken,
 };
+use crate::{IdleToken, Region, Scalable};
 
 #[derive(Clone)]
 pub struct WindowHandle {
-    // Annoyingly Option, because
+    // Annoyingly Option, because we must be default
     wayland_window: Option<Window>,
+    app: Option<AppHandle>,
     properties: Weak<RwLock<WindowProperties>>,
     // Safety: Points to a wl_display instance
     raw_display_handle: Option<*mut c_void>,
@@ -59,11 +60,19 @@ pub struct WindowHandle {
 
 impl WindowHandle {
     #[track_caller]
+    /// Get the wayland window underlying this real window
+    /// This method unwraps the inner window (which may be None because we
+    /// have to implement `Default`)
     fn wayland_window(&self) -> &Window {
         self.wayland_window
             .as_ref()
             .expect("Called operation on dead window")
     }
+
+    fn properties(&self) -> Arc<RwLock<WindowProperties>> {
+        self.properties.upgrade().unwrap()
+    }
+
     pub fn show(&self) {
         tracing::debug!("show initiated");
         self.wayland_window().commit();
@@ -78,11 +87,11 @@ impl WindowHandle {
 
     pub fn show_titlebar(&self, show_titlebar: bool) {
         tracing::warn!("show_titlebar is implemented on a best-effort basis on wayland");
+        // TODO: Track this into the fallback decorations when we add those
         if show_titlebar {
             self.wayland_window()
                 .request_decoration_mode(Some(DecorationMode::Server))
         } else {
-            // TODO: Track this into the fallback decorations, somehow
             self.wayland_window()
                 .request_decoration_mode(Some(DecorationMode::Client))
         }
@@ -105,13 +114,38 @@ impl WindowHandle {
         Insets::from(0.)
     }
 
-    pub fn set_size(&self, _size: Size) {
-        tracing::warn!("set_size is unimplemented on wayland");
+    pub fn set_size(&self, size: Size) {
+        {
+            let props = self.properties();
+            let mut props = props.write().unwrap();
+            props.requested_size = Some(size);
+        }
+
+        let window_id = WindowId::new(self.wayland_window());
+        // We don't need to tell the server about changing the size - so long as the size of the surface gets changed properly
+        // So, all we need to do is to tell the handler about this change (after caching it here)
+
+        // We must defer this, because we're probably in the handler, which we need to call
+        self.app.as_ref().unwrap().run_on_state(move |state| {
+            let window = {
+                let Some(window) = state.windows.get_mut(&window_id) else { return };
+
+                let mut props = window.properties.write().unwrap();
+                let size = props.requested_size.expect("Can't unset requested size");
+                props.current_size = size;
+                window.handler.size(size);
+                window.wayland_window.clone()
+            };
+            let surface = window.wl_surface();
+            // Request a redraw now that the size has changed
+            surface.frame(&state.wayland_queue.clone(), surface.clone());
+        });
     }
 
     pub fn get_size(&self) -> Size {
-        // I think we need to cache the size ourselves
-        todo!()
+        let props = self.properties();
+        let props = props.read().unwrap();
+        props.current_size
     }
 
     pub fn set_window_state(&mut self, state: window::WindowState) {
@@ -200,12 +234,17 @@ impl WindowHandle {
 
     /// Get a handle that can be used to schedule an idle task.
     pub fn get_idle_handle(&self) -> Option<IdleHandle> {
-        todo!()
+        Some(IdleHandle {
+            app: self.app.as_ref().unwrap().clone(),
+            window: WindowId::new(self.wayland_window()),
+        })
     }
 
     /// Get the `Scale` of the window.
     pub fn get_scale(&self) -> Result<Scale, ShellError> {
-        todo!()
+        let props = self.properties();
+        let props = props.read().unwrap();
+        Ok(props.current_scale)
     }
 
     pub fn set_menu(&self, _menu: Menu) {
@@ -243,6 +282,7 @@ impl Default for WindowHandle {
         WindowHandle {
             not_send: Default::default(),
             wayland_window: None,
+            app: None,
             properties: Weak::new(),
             raw_display_handle: None,
         }
@@ -278,11 +318,18 @@ impl IdleHandle {
     where
         F: FnOnce(&mut dyn WinHandler) + Send + 'static,
     {
+        self.add_idle_state_callback(|state| callback(&mut *state.handler))
+    }
+
+    fn add_idle_state_callback<F>(&self, callback: F)
+    where
+        F: FnOnce(&mut WindowState) + Send + 'static,
+    {
         let window = self.window.clone();
         self.app.run_idle(move |state| {
             let win_state = state.windows.borrow_mut().get_mut(&window);
             if let Some(win_state) = win_state {
-                callback(&mut *win_state.handler);
+                callback(&mut *win_state);
             } else {
                 tracing::error!("Ran add_idle_callback on a window which no longer exists")
             }
@@ -409,12 +456,18 @@ impl WindowId {
 pub struct WindowState {
     handler: Box<dyn WinHandler>,
     wayland_window: Window,
+    // TODO: Rc<RefCell>?
     properties: Arc<RwLock<WindowProperties>>,
 }
 
+#[derive(Clone)]
 struct WindowProperties {
+    // Requested size is used in configure, if it's supported
     requested_size: Option<Size>,
-    current_dimensions: [u32; 2],
+    // The dimensions of the surface we reported to the handler, and so report in get_size()
+    // Wayland gives strong deference to the application on surface size
+    // so, for example an application using wgpu could have the surface configured to be a different size
+    current_size: Size,
     current_scale: Scale,
 }
 
@@ -437,9 +490,19 @@ impl CompositorHandler for WaylandState {
         let window = window.expect("Should only get events for real windows");
         let factor = f64::from(new_factor);
         let scale = Scale::new(factor, factor);
+        let new_size;
+        {
+            let mut props = window.properties.write().unwrap();
+            // TODO: Effectively, we need to re-evaluate the size calculation
+            // That means we need to cache the WindowConfigure or (mostly) equivalent
+            let cur_size_raw = props.current_size.to_px(props.current_scale);
+            new_size = cur_size_raw.to_dp(scale);
+            props.current_scale = scale;
+            props.current_size = new_size;
+            // avoid locking the properties into user code
+        }
         window.handler.scale(scale);
-        // TODO: The logical size has changed - report this to the client
-        // window.handler.size(size)
+        window.handler.size(new_size)
     }
 
     fn frame(
@@ -449,7 +512,18 @@ impl CompositorHandler for WaylandState {
         surface: &protocol::wl_surface::WlSurface,
         time: u32,
     ) {
-        let window = self.windows.get_mut(&WindowId::of_surface(surface));
+        let Some(window) = self.windows.get_mut(&WindowId::of_surface(surface)) else { return };
+        window.handler.prepare_paint();
+        // TODO: Apply invalid properly
+        let mut region = Region::EMPTY;
+        // This is clearly very wrong, but might work for now :)
+        region.add_rect(Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 5000.0,
+            y1: 5000.0,
+        });
+        window.handler.paint(&region);
     }
 }
 

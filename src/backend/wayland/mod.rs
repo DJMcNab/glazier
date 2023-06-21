@@ -26,7 +26,7 @@ use smithay_client_toolkit::{
     compositor::CompositorState,
     delegate_registry,
     output::OutputState,
-    reexports::calloop::EventLoop,
+    reexports::{calloop::EventLoop, client::QueueHandle},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     shell::xdg::XdgShell,
@@ -52,6 +52,7 @@ struct WaylandState {
     pub output_state: OutputState,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShell,
+    pub wayland_queue: QueueHandle<Self>,
 
     pub event_loop: Option<EventLoop<'static, Self>>,
     pub handler: Option<Box<dyn AppHandler>>,
