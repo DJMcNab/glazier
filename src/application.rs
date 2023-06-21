@@ -213,4 +213,6 @@ mod test {
 
     sa::assert_not_impl_any!(Application: Send, Sync);
     sa::assert_impl_all!(AppHandle: Send);
+    // TODO: sa::assert_not_impl_all!(AppHandle: Sync);
+    // and same for IdleHandle
 }
