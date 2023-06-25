@@ -18,17 +18,14 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     rc::Rc,
-    sync::{
-        mpsc::{Sender, TryRecvError},
-        Arc, Mutex,
-    },
+    sync::mpsc::{Sender, TryRecvError},
 };
 
 use smithay_client_toolkit::{
     compositor::CompositorState,
     output::OutputState,
     reexports::{
-        calloop::{EventLoop, LoopHandle, LoopSignal},
+        calloop::{channel, EventLoop, LoopHandle, LoopSignal},
         client::{
             globals::registry_queue_init, protocol::wl_compositor, Connection, QueueHandle,
             WaylandSource,
@@ -38,21 +35,21 @@ use smithay_client_toolkit::{
     shell::xdg::XdgShell,
 };
 
-use super::{clipboard, error::Error, IdleCallback, WaylandState};
+use super::{clipboard, error::Error, ActiveAction, IdleAction, WaylandState};
 use crate::{backend::shared::linux, AppHandler};
 
 #[derive(Clone)]
 pub struct Application {
     // `State` is the items stored between `new` and `run`
     // It is stored in an Rc<RefCell>> because Application must be Clone
-    // These items are `take`n in run
+    // The inner is taken in `run`
     state: Rc<RefCell<Option<WaylandState>>>,
     compositor: wl_compositor::WlCompositor,
     wayland_queue: QueueHandle<WaylandState>,
     loop_handle: LoopHandle<'static, WaylandState>,
     loop_signal: LoopSignal,
-    // This Mutex is only required as Sender is (currently artificially) not Sync
-    idle_sender: Arc<Mutex<Sender<IdleCallback>>>,
+    idle_sender: Sender<IdleAction>,
+    loop_sender: channel::Sender<ActiveAction>,
 }
 
 impl Application {
@@ -71,11 +68,28 @@ impl Application {
             .insert(loop_handle.clone())
             .unwrap();
 
+        // We use a channel to delay events until outside of the user's handler
+        // This allows the handler to be used in response to methods
+        let (loop_sender, active_source) = channel::channel();
+        loop_handle
+            .insert_source(active_source, |event, _, state| {
+                match event {
+                    channel::Event::Msg(msg) => match msg {
+                        ActiveAction::Callback(cb) => cb(state),
+                        ActiveAction::Window(id, action) => action.run(state, id),
+                    },
+                    channel::Event::Closed => {
+                        tracing::trace!("All windows dropped, should be exiting")
+                    } // ?
+                }
+            })
+            .unwrap();
+
         let compositor_state: CompositorState = CompositorState::bind(&globals, &qh)?;
         let compositor = compositor_state.wl_compositor().clone();
 
-        let (idle_sender, idle_callbacks) = std::sync::mpsc::channel();
-        let idle_sender = Arc::new(Mutex::new(idle_sender));
+        let (idle_sender, idle_actions) = std::sync::mpsc::channel();
+        let idle_sender = idle_sender;
         let state = WaylandState {
             registry_state: RegistryState::new(&globals),
             output_state: OutputState::new(&globals, &qh),
@@ -83,10 +97,11 @@ impl Application {
             xdg_shell_state: XdgShell::bind(&globals, &qh)?,
             event_loop: Some(event_loop),
             handler: None,
-            idle_callbacks,
+            idle_actions,
             idle_sender: idle_sender.clone(),
             windows: HashMap::new(),
             wayland_queue: qh.clone(),
+            loop_sender: loop_sender.clone(),
         };
         Ok(Application {
             state: Rc::new(RefCell::new(Some(state))),
@@ -95,24 +110,32 @@ impl Application {
             loop_handle,
             loop_signal,
             idle_sender,
+            loop_sender,
         })
     }
 
-    pub fn run(self, _handler: Option<Box<dyn AppHandler>>) {
+    pub fn run(self, handler: Option<Box<dyn AppHandler>>) {
         tracing::info!("wayland event loop initiated");
         let mut state = self
             .state
             .borrow_mut()
             .take()
             .expect("Can only run an application once");
+        state.handler = handler;
         let mut event_loop = state.event_loop.take().unwrap();
         event_loop
             .run(None, &mut state, |state| loop {
-                match state.idle_callbacks.try_recv() {
-                    Ok(cb) => cb(state),
-                    Err(TryRecvError::Empty) => (),
+                match state.idle_actions.try_recv() {
+                    Ok(IdleAction::Callback(cb)) => cb(state),
+                    Ok(IdleAction::Token(window, token)) => match state.windows.get_mut(&window) {
+                        Some(state) => state.handler.idle(token),
+                        None => {
+                            tracing::debug!("Tried to run an idle token on a non-existant window")
+                        }
+                    },
+                    Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        unreachable!("Backend has allowed the shared Sender to be dropped")
+                        unreachable!("Backend has allowed the idle sender to be dropped")
                     }
                 }
             })
@@ -135,18 +158,14 @@ impl Application {
 
     pub fn get_handle(&self) -> Option<AppHandle> {
         Some(AppHandle {
-            wayland_queue: self.wayland_queue.clone(),
-            loop_signal: self.loop_signal.clone(),
-            idle_sender: self.idle_sender.clone(),
+            loop_sender: self.loop_sender.clone(),
         })
     }
 }
 
 #[derive(Clone)]
 pub struct AppHandle {
-    wayland_queue: QueueHandle<WaylandState>,
-    loop_signal: LoopSignal,
-    idle_sender: Arc<Mutex<Sender<IdleCallback>>>,
+    loop_sender: channel::Sender<ActiveAction>,
 }
 
 impl AppHandle {
@@ -156,7 +175,7 @@ impl AppHandle {
     {
         // For reasons unknown, inlining this call gives lifetime errors
         // Luckily, this appears to work, so just leave it there
-        self.run_on_main_inner(|it| {
+        self.run_on_main_state(|it| {
             callback(match it {
                 Some(it) => Some(&mut **it),
                 None => None,
@@ -164,34 +183,21 @@ impl AppHandle {
         })
     }
 
-    fn run_on_main_inner<F>(&self, callback: F)
+    #[track_caller]
+    /// Run a callback on the AppState
+    fn run_on_main_state<F>(&self, callback: F)
     where
         F: FnOnce(Option<&mut Box<dyn AppHandler>>) + Send + 'static,
     {
-        self.run_on_state(move |state| callback(state.handler.as_mut()));
-    }
-
-    /// Run a function when the event loop is idle
-    /// This does not wake up the event loop to run this handler
-    // TODO: Should it?
-    pub(super) fn run_idle<F>(&self, callback: F)
-    where
-        F: FnOnce(&mut WaylandState) + Send + 'static,
-    {
-        self.idle_sender
-            .lock()
-            .unwrap()
-            .send(Box::new(move |state| callback(state)))
-            .expect("AppHandle should exist whilst");
-    }
-
-    /// Same as run_idle, but wakes up the main thread
-    /// TODO: Should this be a manual calloop thing?
-    pub(super) fn run_on_state<F>(&self, callback: F)
-    where
-        F: FnOnce(&mut WaylandState) + Send + 'static,
-    {
-        self.run_idle(callback);
-        self.loop_signal.wakeup();
+        match self
+            .loop_sender
+            .send(ActiveAction::Callback(Box::new(|state| {
+                callback(state.handler.as_mut())
+            }))) {
+            Ok(()) => (),
+            Err(err) => {
+                tracing::warn!("Sending idle event loop failed: {err:?}")
+            }
+        };
     }
 }
