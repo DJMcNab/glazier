@@ -17,7 +17,8 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    rc::Rc,
+    ffi::c_void,
+    rc::{Rc, Weak},
     sync::mpsc::{Sender, TryRecvError},
 };
 
@@ -44,12 +45,14 @@ pub struct Application {
     // It is stored in an Rc<RefCell>> because Application must be Clone
     // The inner is taken in `run`
     state: Rc<RefCell<Option<WaylandState>>>,
-    compositor: wl_compositor::WlCompositor,
-    wayland_queue: QueueHandle<WaylandState>,
+    pub(super) compositor: wl_compositor::WlCompositor,
+    pub(super) wayland_queue: QueueHandle<WaylandState>,
+    pub(super) xdg_shell: Weak<XdgShell>,
     loop_handle: LoopHandle<'static, WaylandState>,
     loop_signal: LoopSignal,
-    idle_sender: Sender<IdleAction>,
-    loop_sender: channel::Sender<ActiveAction>,
+    pub(super) idle_sender: Sender<IdleAction>,
+    pub(super) loop_sender: channel::Sender<ActiveAction>,
+    pub(super) raw_display_handle: *mut c_void,
 }
 
 impl Application {
@@ -89,12 +92,13 @@ impl Application {
         let compositor = compositor_state.wl_compositor().clone();
 
         let (idle_sender, idle_actions) = std::sync::mpsc::channel();
-        let idle_sender = idle_sender;
+        let shell = Rc::new(XdgShell::bind(&globals, &qh)?);
+        let shell_ref = Rc::downgrade(&shell);
         let state = WaylandState {
             registry_state: RegistryState::new(&globals),
             output_state: OutputState::new(&globals, &qh),
             compositor_state,
-            xdg_shell_state: XdgShell::bind(&globals, &qh)?,
+            xdg_shell_state: shell,
             event_loop: Some(event_loop),
             handler: None,
             idle_actions,
@@ -102,6 +106,7 @@ impl Application {
             windows: HashMap::new(),
             wayland_queue: qh.clone(),
             loop_sender: loop_sender.clone(),
+            loop_signal: loop_signal.clone(),
         };
         Ok(Application {
             state: Rc::new(RefCell::new(Some(state))),
@@ -111,6 +116,8 @@ impl Application {
             loop_signal,
             idle_sender,
             loop_sender,
+            xdg_shell: shell_ref,
+            raw_display_handle: conn.backend().display_ptr().cast(),
         })
     }
 
@@ -201,3 +208,6 @@ impl AppHandle {
         };
     }
 }
+
+// SAFETY: We only send `Send` items through the channel
+unsafe impl Send for AppHandle {}

@@ -25,9 +25,13 @@ use raw_window_handle::{
 };
 use smithay_client_toolkit::compositor::CompositorHandler;
 use smithay_client_toolkit::reexports::calloop::channel;
+use smithay_client_toolkit::reexports::client::protocol::wl_compositor::WlCompositor;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{protocol, Connection, Proxy, QueueHandle};
-use smithay_client_toolkit::shell::xdg::window::{DecorationMode, Window, WindowHandler};
+use smithay_client_toolkit::shell::xdg::window::{
+    DecorationMode, Window, WindowDecorations, WindowHandler,
+};
+use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_compositor, delegate_xdg_shell, delegate_xdg_window};
 use tracing;
@@ -47,7 +51,7 @@ use crate::{
     window::{self, FileDialogToken, TimerToken, WinHandler, WindowLevel},
     TextFieldToken,
 };
-use crate::{IdleToken, Region};
+use crate::{IdleToken, Region, Scalable};
 
 #[derive(Clone)]
 pub struct WindowHandle {
@@ -56,13 +60,13 @@ pub struct WindowHandle {
     properties: Weak<RefCell<WindowProperties>>,
     // Safety: Points to a wl_display instance
     raw_display_handle: Option<*mut c_void>,
-    not_send: PhantomData<*mut ()>,
 }
 
 impl WindowHandle {
     fn id(&self) -> WindowId {
         let props = self.properties();
-        WindowId::new(props.wayland_window())
+        let props = props.borrow();
+        WindowId::new(&props.wayland_window)
     }
 
     fn defer(&self, action: WindowAction) {
@@ -71,18 +75,16 @@ impl WindowHandle {
             .expect("Running on a window should only occur whilst application is active")
     }
 
-    fn properties(&self) -> std::cell::Ref<WindowProperties> {
-        self.properties.upgrade().unwrap().borrow()
-    }
-
-    fn properties_mut(&self) -> std::cell::RefMut<WindowProperties> {
-        self.properties.upgrade().unwrap().borrow_mut()
+    fn properties(&self) -> Rc<RefCell<WindowProperties>> {
+        self.properties.upgrade().unwrap()
     }
 
     pub fn show(&self) {
         tracing::debug!("show initiated");
         let props = self.properties();
-        props.wayland_window().commit();
+        let props = props.borrow();
+        // TODO: Is this valid? Do we instead need to
+        props.wayland_window.commit();
     }
 
     pub fn resizable(&self, resizable: bool) {
@@ -95,13 +97,14 @@ impl WindowHandle {
         tracing::info!("show_titlebar is implemented on a best-effort basis on wayland");
         // TODO: Track this into the fallback decorations when we add those
         let props = self.properties();
+        let props = props.borrow();
         if show_titlebar {
             props
-                .wayland_window()
+                .wayland_window
                 .request_decoration_mode(Some(DecorationMode::Server))
         } else {
             props
-                .wayland_window()
+                .wayland_window
                 .request_decoration_mode(Some(DecorationMode::Client))
         }
     }
@@ -124,8 +127,8 @@ impl WindowHandle {
     }
 
     pub fn set_size(&self, size: Size) {
-        let mut props = self.properties_mut();
-        props.requested_size = Some(size);
+        let props = self.properties();
+        props.borrow_mut().requested_size = Some(size);
 
         // We don't need to tell the server about changing the size - so long as the size of the surface gets changed properly
         // So, all we need to do is to tell the handler about this change (after caching it here)
@@ -135,16 +138,18 @@ impl WindowHandle {
 
     pub fn get_size(&self) -> Size {
         let props = self.properties();
+        let props = props.borrow();
         props.current_size
     }
 
     pub fn set_window_state(&mut self, state: window::WindowState) {
         let props = self.properties();
+        let props = props.borrow();
         match state {
-            crate::WindowState::Maximized => props.wayland_window().set_maximized(),
-            crate::WindowState::Minimized => props.wayland_window().set_minimized(),
+            crate::WindowState::Maximized => props.wayland_window.set_maximized(),
+            crate::WindowState::Minimized => props.wayland_window.set_minimized(),
             // TODO: I don't think we can do much better than this - we can't unset being minimised
-            crate::WindowState::Restored => props.wayland_window().unset_maximized(),
+            crate::WindowState::Restored => props.wayland_window.unset_maximized(),
         }
     }
 
@@ -170,12 +175,15 @@ impl WindowHandle {
 
     /// Request a new paint, but without invalidating anything.
     pub fn request_anim_frame(&self) {
-        todo!()
+        let props = self.properties();
+        let props = props.borrow();
+        let surface = props.wayland_window.wl_surface();
+        surface.frame(&props.wayland_queue, surface.clone());
     }
 
     /// Request invalidation of the entire window contents.
     pub fn invalidate(&self) {
-        todo!()
+        self.request_anim_frame();
     }
 
     /// Request invalidation of one rectangle, which is given in display points relative to the
@@ -185,7 +193,8 @@ impl WindowHandle {
     }
 
     pub fn add_text_field(&self) -> TextFieldToken {
-        todo!()
+        tracing::error!("Don't have text fields yet");
+        TextFieldToken::INVALID
     }
 
     pub fn remove_text_field(&self, _token: TextFieldToken) {
@@ -193,7 +202,7 @@ impl WindowHandle {
     }
 
     pub fn set_focused_text_field(&self, _active_field: Option<TextFieldToken>) {
-        todo!()
+        tracing::error!("Don't have text fields yet");
     }
 
     pub fn update_text_field(&self, _token: TextFieldToken, _update: Event) {
@@ -234,6 +243,7 @@ impl WindowHandle {
     /// Get the `Scale` of the window.
     pub fn get_scale(&self) -> Result<Scale, ShellError> {
         let props = self.properties();
+        let props = props.borrow();
         Ok(props.current_scale)
     }
 
@@ -260,7 +270,7 @@ impl WindowHandle {
 
 impl PartialEq for WindowHandle {
     fn eq(&self, rhs: &Self) -> bool {
-        self.wayland_window() == rhs.wayland_window()
+        self.properties.ptr_eq(&rhs.properties)
     }
 }
 
@@ -273,8 +283,6 @@ impl Default for WindowHandle {
         let (loop_sender, _) = channel::channel();
         // TODO: Why is this Default?
         WindowHandle {
-            not_send: Default::default(),
-            wayland_window: None,
             properties: Weak::new(),
             raw_display_handle: None,
             idle_sender,
@@ -286,7 +294,8 @@ impl Default for WindowHandle {
 unsafe impl HasRawWindowHandle for WindowHandle {
     fn raw_window_handle(&self) -> RawWindowHandle {
         let mut handle = WaylandWindowHandle::empty();
-        handle.surface = self.wayland_window().wl_surface().id().as_ptr() as *mut _;
+        let props = self.properties();
+        handle.surface = props.borrow().wayland_window.wl_surface().id().as_ptr() as *mut _;
         RawWindowHandle::Wayland(handle)
     }
 }
@@ -320,7 +329,8 @@ impl IdleHandle {
         F: FnOnce(&mut WindowState) + Send + 'static,
     {
         let window = self.window.clone();
-        self.idle_sender
+        match self
+            .idle_sender
             .send(IdleAction::Callback(Box::new(move |state| {
                 let win_state = state.windows.get_mut(&window);
                 if let Some(win_state) = win_state {
@@ -328,7 +338,12 @@ impl IdleHandle {
                 } else {
                     tracing::error!("Ran add_idle_callback on a window which no longer exists")
                 }
-            })));
+            }))) {
+            Ok(()) => (),
+            Err(err) => {
+                tracing::warn!("Added idle callback for invalid application: {err:?}")
+            }
+        };
     }
 
     pub fn add_idle_token(&self, token: IdleToken) {
@@ -354,25 +369,37 @@ pub(crate) struct WindowBuilder {
     level: WindowLevel,
     state: Option<window::WindowState>,
     // pre-scaled
-    size: Size,
+    size: Option<Size>,
     min_size: Option<Size>,
     resizable: bool,
     show_titlebar: bool,
+    compositor: WlCompositor,
+    wayland_queue: QueueHandle<WaylandState>,
+    xdg_state: Weak<XdgShell>,
+    idle_sender: Sender<IdleAction>,
+    loop_sender: channel::Sender<ActiveAction>,
+    raw_display_handle: *mut c_void,
 }
 
 impl WindowBuilder {
-    pub fn new(_app: application::Application) -> WindowBuilder {
+    pub fn new(app: application::Application) -> WindowBuilder {
         WindowBuilder {
             handler: None,
             title: String::new(),
             menu: None,
-            size: Size::new(0.0, 0.0),
+            size: None,
             position: None,
             level: WindowLevel::AppWindow,
             state: None,
             min_size: None,
             resizable: true,
             show_titlebar: true,
+            compositor: app.compositor,
+            wayland_queue: app.wayland_queue,
+            xdg_state: app.xdg_shell,
+            idle_sender: app.idle_sender,
+            loop_sender: app.loop_sender,
+            raw_display_handle: app.raw_display_handle,
         }
     }
 
@@ -382,7 +409,7 @@ impl WindowBuilder {
     }
 
     pub fn size(mut self, size: Size) -> Self {
-        self.size = size;
+        self.size = Some(size);
         self
     }
 
@@ -402,7 +429,7 @@ impl WindowBuilder {
     }
 
     pub fn transparent(self, _transparent: bool) -> Self {
-        tracing::warn!(
+        tracing::info!(
             "WindowBuilder::transparent is unimplemented for Wayland, it allows transparency by default"
         );
         self
@@ -434,7 +461,56 @@ impl WindowBuilder {
     }
 
     pub fn build(self) -> Result<WindowHandle, ShellError> {
-        todo!()
+        let surface = self
+            .compositor
+            .create_surface(&self.wayland_queue, Default::default());
+        let xdg_shell = self
+            .xdg_state
+            .upgrade()
+            .expect("Can only build whilst event loop hasn't ended");
+        let wayland_window = xdg_shell.create_window(
+            surface,
+            // Request server decorations, because we don't yet do client decorations properly
+            WindowDecorations::RequestServer,
+            &self.wayland_queue,
+        );
+        wayland_window.set_title(self.title);
+        // TODO: Pass this down
+        wayland_window.set_app_id("org.linebender.glazier.user_app");
+        // TODO: Convert properly, set all properties
+        // wayland_window.set_min_size(self.min_size);
+        let window_id = WindowId::new(&wayland_window);
+        let properties = WindowProperties {
+            requested_size: self.size,
+            current_size: Size::new(0., 0.),
+            current_scale: Scale::new(1., 1.), // TODO: NaN? - these values should (must?) not be used
+            wayland_window,
+            wayland_queue: self.wayland_queue.clone(),
+        };
+        let properties_strong = Rc::new(RefCell::new(properties));
+
+        let properties = Rc::downgrade(&properties_strong);
+        let handle = WindowHandle {
+            idle_sender: self.idle_sender,
+            loop_sender: self.loop_sender.clone(),
+            raw_display_handle: Some(self.raw_display_handle),
+            properties,
+        };
+        // TODO: When should Window::commit be called? This feels fragile
+        self.loop_sender
+            .send(ActiveAction::Window(
+                window_id,
+                WindowAction::Create(
+                    WindowState {
+                        handler: self.handler.unwrap(),
+                        properties: properties_strong,
+                    },
+                    handle.clone(),
+                ),
+            ))
+            .expect("Event loop should still be valid");
+
+        Ok(handle)
     }
 }
 
@@ -455,7 +531,6 @@ impl WindowId {
 /// The state associated with each window, stored in [`WaylandState`]
 pub(super) struct WindowState {
     pub handler: Box<dyn WinHandler>,
-    wayland_window: Window,
     // TODO: Rc<RefCell>?
     properties: Rc<RefCell<WindowProperties>>,
 }
@@ -471,15 +546,8 @@ struct WindowProperties {
     // The underlying wayland Window
     // The way to close this Window is to drop the handle
     // We make this the only handle, so we can definitely drop it
-    wayland_window: Option<Window>,
-}
-
-impl WindowProperties {
-    fn wayland_window(&self) -> &Window {
-        self.wayland_window
-            .as_ref()
-            .expect("Shouldn't operate on closed window")
-    }
+    wayland_window: Window,
+    wayland_queue: QueueHandle<WaylandState>,
 }
 
 delegate_xdg_shell!(WaylandState);
@@ -490,8 +558,8 @@ delegate_compositor!(WaylandState);
 impl CompositorHandler for WaylandState {
     fn scale_factor_changed(
         &mut self,
-        conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
         surface: &protocol::wl_surface::WlSurface,
         // TODO: Support the fractional-scaling extension instead
         // This requires an update in client-toolkit and wayland-protocols
@@ -503,7 +571,7 @@ impl CompositorHandler for WaylandState {
         let scale = Scale::new(factor, factor);
         let new_size;
         {
-            let mut props = window.properties.write().unwrap();
+            let mut props = window.properties.borrow_mut();
             // TODO: Effectively, we need to re-evaluate the size calculation
             // That means we need to cache the WindowConfigure or (mostly) equivalent
             let cur_size_raw = props.current_size.to_px(props.current_scale);
@@ -513,27 +581,31 @@ impl CompositorHandler for WaylandState {
             // avoid locking the properties into user code
         }
         window.handler.scale(scale);
-        window.handler.size(new_size)
+        window.handler.size(new_size);
+        // TODO: Do we repaint here?
     }
 
     fn frame(
         &mut self,
-        conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
         surface: &protocol::wl_surface::WlSurface,
-        time: u32,
+        _: u32,
     ) {
         let Some(window) = self.windows.get_mut(&WindowId::of_surface(surface)) else { return };
         window.handler.prepare_paint();
         // TODO: Apply invalid properly
         let mut region = Region::EMPTY;
-        // This is clearly very wrong, but might work for now :)
-        region.add_rect(Rect {
-            x0: 0.0,
-            y0: 0.0,
-            x1: 5000.0,
-            y1: 5000.0,
-        });
+        {
+            let props = window.properties.borrow();
+            let size = props.current_size.to_dp(props.current_scale);
+            region.add_rect(Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: size.width,
+                y1: size.height,
+            });
+        }
         window.handler.paint(&region);
     }
 }
@@ -551,13 +623,43 @@ impl WindowHandler for WaylandState {
 
     fn configure(
         &mut self,
-        conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
         window: &smithay_client_toolkit::shell::xdg::window::Window,
         configure: smithay_client_toolkit::shell::xdg::window::WindowConfigure,
-        serial: u32,
+        _: u32,
     ) {
-        let window: Option<&mut WindowState> = self.windows.get_mut(&WindowId::new(window));
+        let window = if let Some(window) = self.windows.get_mut(&WindowId::new(window)) {
+            window
+        } else {
+            // Using let else here breaks formatting with rustfmt
+            tracing::warn!("Recieved configure event for unknown window");
+            return;
+        };
+        // TODO: Actually use the suggestions in the configure event
+        let mut region = Region::EMPTY;
+        let new_width = configure.new_size.0.map_or(256, |it| it.get());
+        let new_height = configure.new_size.0.map_or(256, |it| it.get());
+        let new_size_absolute = Size {
+            height: new_height.into(),
+            width: new_width.into(),
+        };
+        let display_size;
+        {
+            let mut props = window.properties.borrow_mut();
+            display_size = new_size_absolute.to_dp(props.current_scale);
+            props.current_size = display_size;
+            region.add_rect(Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: display_size.width,
+                y1: display_size.height,
+            });
+        };
+        window.handler.size(display_size);
+        // TODO: Should we defer this (to reuse the same logic?)
+        window.handler.prepare_paint();
+        window.handler.paint(&region);
     }
 }
 
@@ -568,40 +670,47 @@ pub(super) enum WindowAction {
     ResizeRequested,
     /// Close the Window
     Close,
+    Create(WindowState, WindowHandle),
 }
 
 impl WindowAction {
     pub(super) fn run(self, state: &mut WaylandState, window_id: WindowId) {
         match self {
             WindowAction::ResizeRequested => {
-                let window = {
-                    let Some(window) = state.windows.get_mut(&window_id) else { return };
-
+                let Some(window) = state.windows.get_mut(&window_id) else { return };
+                let (size, surface) = {
                     let mut props = window.properties.borrow_mut();
                     // TODO: Should this requested_size be taken?
                     // Reason to suspect it should be would be resizes (if enabled)
                     let size = props.requested_size.expect("Can't unset requested size");
                     props.current_size = size;
-                    // TODO: Ensure we follow the rules laid out by the compositor in `configure`
-                    window.handler.size(size);
-                    window.wayland_window.clone()
+                    let surface = props.wayland_window.wl_surface().clone();
+                    (size, surface)
                 };
+                // TODO: Ensure we follow the rules laid out by the compositor in `configure`
+                window.handler.size(size);
                 // TODO: Don't stack up frame callbacks - need to ensure only one per `paint` call?
-                let surface = window.wl_surface();
-                // Request a redraw now that the size has changed
+                // Request a redraw now that the size has changed (?) - should the application do this/
+                // should this be synchronous(?)
                 surface.frame(&state.wayland_queue.clone(), surface.clone());
             }
             WindowAction::Close => {
                 // Remove the window from tracking
-                let Some(window) = state.windows.remove(&window_id) else {
+                let Some(_) = state.windows.remove(&window_id) else {
                     tracing::error!("Tried to close the same window twice");
                     return;
                 };
-                // We will drop the proper wayland window later
-                let mut props = window.properties.borrow_mut();
+                // We will drop the proper wayland window later when we Drop window.props
                 if state.windows.is_empty() {
                     state.loop_signal.stop();
                 }
+            }
+            Self::Create(win_state, handle) => {
+                let res = state.windows.entry(window_id);
+                let win_state = res.or_insert(win_state);
+                win_state.handler.connect(&crate::WindowHandle(
+                    crate::backend::window::WindowHandle::Wayland(handle),
+                ));
             }
         }
     }

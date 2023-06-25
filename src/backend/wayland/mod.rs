@@ -16,10 +16,8 @@
 
 use std::{
     collections::HashMap,
-    sync::{
-        mpsc::{Receiver, Sender},
-        Arc, Mutex,
-    },
+    rc::Rc,
+    sync::mpsc::{Receiver, Sender},
 };
 
 use smithay_client_toolkit::{
@@ -67,7 +65,7 @@ struct WaylandState {
     // seat_state: SeatState,
     pub output_state: OutputState,
     pub compositor_state: CompositorState,
-    pub xdg_shell_state: XdgShell,
+    pub xdg_shell_state: Rc<XdgShell>,
     pub wayland_queue: QueueHandle<Self>,
 
     pub event_loop: Option<EventLoop<'static, Self>>,
