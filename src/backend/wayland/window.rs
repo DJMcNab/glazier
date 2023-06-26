@@ -639,7 +639,7 @@ impl WindowHandler for WaylandState {
         // TODO: Actually use the suggestions in the configure event
         let mut region = Region::EMPTY;
         let new_width = configure.new_size.0.map_or(256, |it| it.get());
-        let new_height = configure.new_size.0.map_or(256, |it| it.get());
+        let new_height = configure.new_size.1.map_or(256, |it| it.get());
         let new_size_absolute = Size {
             height: new_height.into(),
             width: new_width.into(),
