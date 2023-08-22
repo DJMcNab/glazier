@@ -24,10 +24,11 @@ use smithay_client_toolkit::{
         client::{protocol::wl_seat, Connection, QueueHandle},
         protocols::wp::text_input::zv3::client::zwp_text_input_v3,
     },
-    seat::SeatHandler,
+    seat::{pointer::PointerData, SeatHandler},
 };
 
 mod keyboard;
+mod pointer;
 mod text_input;
 
 pub(super) use text_input::TextInputManagerData;
@@ -572,7 +573,9 @@ impl SeatHandler for WaylandState {
                 let state = KeyboardState::new(qh, seat_info.id, seat);
                 seat_info.keyboard_state = Some(state);
             }
-            smithay_client_toolkit::seat::Capability::Pointer => {}
+            smithay_client_toolkit::seat::Capability::Pointer => {
+                let pointer = seat.get_pointer(qh, PointerData::new(seat.clone()));
+            }
             smithay_client_toolkit::seat::Capability::Touch => {}
             it => tracing::warn!(?seat, "Unknown seat capability {it}"),
         }
