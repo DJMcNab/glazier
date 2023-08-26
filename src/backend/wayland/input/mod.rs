@@ -10,7 +10,7 @@ use crate::{
     Counter, TextFieldToken, WinHandler,
 };
 
-use self::{keyboard::KeyboardState, text_input::InputState};
+use self::{keyboard::KeyboardState, pointer::PointerState, text_input::InputState};
 
 use super::{
     window::{WaylandWindowState, WindowId},
@@ -81,6 +81,8 @@ pub(super) struct SeatInfo {
     keyboard_state: Option<KeyboardState>,
     input_state: Option<InputState>,
     keyboard_focused: Option<WindowId>,
+
+    pointer_state: Option<PointerState>,
 
     text_field_owner: TextFieldOwner,
 }
